@@ -7,9 +7,11 @@ reports so the UI can explain why a message or document received a verdict.
 
 import logging
 import re
+import csv
 from pathlib import Path
 
 from django.conf import settings
+from django.http import HttpResponse
 from django.shortcuts import render
 
 try:
@@ -40,6 +42,7 @@ except ImportError:  # pragma: no cover - handled as an unavailable classifier
     MultinomialNB = None
 
 from forms import MessageForm
+from detector.models import ScanRecord
 
 
 logger = logging.getLogger(__name__)
@@ -632,6 +635,25 @@ def _pdf_pipeline(report, extracted):
     ]
 
 
+def _report_confidence(report):
+    return {"high": 1.0, "medium": 0.5, "low": 0.0}.get(report.get("confidence"))
+
+
+def _record_scan(scan_type, report, input_length):
+    ScanRecord.objects.create(
+        scan_type=scan_type,
+        verdict=report["verdict"],
+        confidence=_report_confidence(report),
+        input_length=input_length,
+        indicators=[
+            reason["evidence"]
+            for reason in report.get("reasons", [])
+            if reason.get("evidence")
+        ],
+        summary=report["recommendation"],
+    )
+
+
 def Home(request):
     result = None
     pdf_result = None
@@ -659,6 +681,7 @@ def Home(request):
                 email_text = submitted_text[:EMAIL_PREVIEW_LIMIT]
                 email_text_truncated = len(submitted_text) > EMAIL_PREVIEW_LIMIT
                 email_pipeline = _email_pipeline(email_report)
+                _record_scan(ScanRecord.ScanType.EMAIL, email_report, len(submitted_text))
         elif "pdf_check" in request.POST:
             pdf_file = request.FILES.get("pdf_file")
             if pdf_file is None:
@@ -684,6 +707,7 @@ def Home(request):
                         pdf_message = "The PDF could not be confidently classified."
                     else:
                         pdf_message = f"PDF Threat Result: {pdf_result.upper()}"
+                    _record_scan(ScanRecord.ScanType.PDF, pdf_report, len(pdf_text))
 
     return render(request, "home.html", {
         "form": form,
@@ -701,3 +725,37 @@ def Home(request):
         "pdf_legacy_label": pdf_legacy_label,
         "pdf_pipeline": pdf_pipeline,
     })
+
+
+def history(request):
+    return render(request, "history.html", {"records": ScanRecord.objects.all()[:100]})
+
+
+def export_history(request):
+    response = HttpResponse(content_type="text/csv")
+    response["Content-Disposition"] = 'attachment; filename="scan-history.csv"'
+    writer = csv.writer(response)
+    writer.writerow(
+        [
+            "created_at",
+            "scan_type",
+            "verdict",
+            "confidence",
+            "input_length",
+            "indicators",
+            "summary",
+        ]
+    )
+    for record in ScanRecord.objects.all():
+        writer.writerow(
+            [
+                record.created_at.isoformat(),
+                record.scan_type,
+                record.verdict,
+                record.confidence if record.confidence is not None else "",
+                record.input_length,
+                "; ".join(record.indicators or []),
+                record.summary,
+            ]
+        )
+    return response

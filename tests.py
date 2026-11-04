@@ -3,6 +3,7 @@ from unittest.mock import patch
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 
+from detector.models import ScanRecord
 from views import analyze_email, analyze_pdf_text, rule_based_pdf_check
 
 
@@ -175,3 +176,46 @@ class ThreatAnalysisTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "exceeds the maximum upload size")
+
+
+class ScanHistoryTests(TestCase):
+    def test_email_scan_is_recorded_without_raw_content(self):
+        message = "Congratulations, claim your free prize now!"
+        response = self.client.post("/", {"text": message, "email_check": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        record = ScanRecord.objects.get()
+        self.assertEqual(record.scan_type, ScanRecord.ScanType.EMAIL)
+        self.assertEqual(record.input_length, len(message))
+        self.assertNotIn("Congratulations", record.summary)
+
+    @patch("views.extract_pdf_text", return_value="powershell disable antivirus")
+    def test_pdf_scan_is_recorded_with_indicators(self, extract_pdf_text):
+        upload = SimpleUploadedFile(
+            "threat.pdf",
+            b"%PDF-1.7\nvalid test fixture",
+            content_type="application/pdf",
+        )
+        response = self.client.post("/", {"pdf_check": "1", "pdf_file": upload})
+
+        self.assertEqual(response.status_code, 200)
+        record = ScanRecord.objects.get()
+        self.assertEqual(record.scan_type, ScanRecord.ScanType.PDF)
+        self.assertEqual(record.verdict, ScanRecord.Verdict.MALICIOUS)
+        self.assertIn("powershell", record.indicators)
+        extract_pdf_text.assert_called_once()
+
+    def test_history_and_csv_export_are_available(self):
+        ScanRecord.objects.create(
+            scan_type=ScanRecord.ScanType.EMAIL,
+            verdict=ScanRecord.Verdict.HAM,
+            input_length=12,
+        )
+
+        history = self.client.get("/history/")
+        export = self.client.get("/history/export.csv")
+
+        self.assertContains(history, "Ham")
+        self.assertEqual(export.status_code, 200)
+        self.assertIn("text/csv", export["Content-Type"])
+        self.assertIn("scan_type", export.content.decode())
