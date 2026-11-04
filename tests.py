@@ -4,7 +4,57 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 
 from detector.models import ScanRecord
-from views import analyze_email, analyze_pdf_text, rule_based_pdf_check
+from views import (
+    analyze_email,
+    analyze_pdf_indicators,
+    analyze_pdf_text,
+    normalize_pdf_text,
+    rule_based_pdf_check,
+)
+
+
+class StructuredPdfIndicatorTests(TestCase):
+    def test_normalizes_obfuscated_urls(self):
+        self.assertEqual(
+            normalize_pdf_text("Visit hxxps://secure[dot]example[.]com"),
+            "Visit https://secure.example.com",
+        )
+
+    def test_extracts_urls_domains_addresses_attachments_and_signals(self):
+        report = analyze_pdf_indicators(
+            "Email security@example.com and visit hxxp://login[dot]example.com. "
+            "Open invoice.zip immediately and pay the payment."
+        )
+
+        indicator_types = {item["type"] for item in report["indicators"]}
+        self.assertTrue(
+            {
+                "url",
+                "domain",
+                "email_address",
+                "attachment",
+                "urgency",
+                "payment_request",
+            }.issubset(indicator_types)
+        )
+        self.assertEqual(report["verdict"], "suspicious")
+
+    def test_detects_obfuscated_commands_as_malicious(self):
+        report = analyze_pdf_indicators(
+            "Run p o w e r s h e l l and disable anti virus, then execute payload."
+        )
+
+        self.assertEqual(report["verdict"], "malicious")
+        self.assertTrue(
+            any(item["type"] == "obfuscated_command" for item in report["indicators"])
+        )
+
+    def test_structured_indicators_are_attached_to_pdf_report(self):
+        report = analyze_pdf_text("Visit hxxps://login[dot]example.com immediately.")
+
+        self.assertEqual(report["verdict"], "suspicious")
+        self.assertGreater(report["indicator_counts"]["total"], 0)
+        self.assertTrue(report["structured_indicators"])
 
 
 class ThreatAnalysisTests(TestCase):

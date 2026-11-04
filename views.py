@@ -8,6 +8,7 @@ reports so the UI can explain why a message or document received a verdict.
 import logging
 import re
 import csv
+import unicodedata
 from pathlib import Path
 
 from django.conf import settings
@@ -413,14 +414,118 @@ def extract_pdf_text(file_obj):
         return ""
 
 
+def normalize_pdf_text(pdf_text):
+    """Normalize Unicode, whitespace, and common URL obfuscation."""
+    text = unicodedata.normalize("NFKC", str(pdf_text or ""))
+    text = text.replace("\u200b", "").replace("\ufeff", "")
+    text = re.sub(r"(?i)\bhxxps?\s*:\s*//", "https://", text)
+    text = re.sub(r"(?i)\bwww\s*\[\s*dot\s*\]\s*", "www.", text)
+    text = re.sub(
+        r"(?i)\[\s*(?:dot|\.)\s*\]|\(\s*dot\s*\)|\s+dot\s+",
+        ".",
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _pdf_indicator(kind, value, severity):
+    return {
+        "type": kind,
+        "value": value,
+        "severity": severity,
+        "evidence": value,
+    }
+
+
+def analyze_pdf_indicators(pdf_text):
+    """Extract explainable URLs, commands, attachments, and social signals."""
+    text = normalize_pdf_text(pdf_text)
+    lowered = text.lower()
+    indicators = []
+
+    urls = []
+    for match in re.findall(r"(?i)\b(?:https?://|www\.)[^\s<>'\"]+", text):
+        url = match.rstrip(".,;:!?)]}")
+        if url not in urls:
+            urls.append(url)
+            indicators.append(_pdf_indicator("url", url, "medium"))
+
+    domains = []
+    domain_pattern = (
+        r"(?i)(?<![@\w])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+        r"[a-z]{2,63}\b"
+    )
+    for domain in re.findall(domain_pattern, text):
+        domain = domain.lower().rstrip(".")
+        if domain not in domains:
+            domains.append(domain)
+            indicators.append(_pdf_indicator("domain", domain, "high"))
+
+    for address in dict.fromkeys(
+        re.findall(r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,63}\b", lowered)
+    ):
+        indicators.append(_pdf_indicator("email_address", address, "low"))
+
+    attachment_pattern = (
+        r"(?i)\b[\w .-]+\.(?:exe|scr|js|vbs|ps1|bat|cmd|msi|dll|iso|img|"
+        r"docm|xlsm|pptm|zip|rar|7z)\b"
+    )
+    for attachment in dict.fromkeys(
+        match.strip() for match in re.findall(attachment_pattern, text)
+    ):
+        indicators.append(_pdf_indicator("attachment", attachment, "high"))
+
+    deobfuscated = re.sub(r"[\s._-]+", "", lowered)
+    command_patterns = {
+        "obfuscated_command": r"(?:powershell|p0wershell|commandprompt)",
+        "command_execution": r"(?:cmd(?:/c|\.exe/c)|shellcode)",
+        "encoded_command": r"(?:-enc(?:odedcommand)?|frombase64string|base64)",
+        "payload_execution": r"(?:execute|run|download)(?:the)?payload",
+        "security_bypass": r"(?:disable|bypass)(?:your)?(?:antivirus|security|defender)",
+        "malware": r"(?:malware|ransomware|trojan|exploit)",
+    }
+    for kind, pattern in command_patterns.items():
+        for match in dict.fromkeys(re.findall(pattern, deobfuscated)):
+            indicators.append(_pdf_indicator(kind, match, "critical"))
+
+    signal_patterns = {
+        "urgency": r"\b(?:urgent|immediately|final warning|act now|expires today)\b",
+        "payment_request": r"\b(?:payment|pay now|invoice|refund|customs charge|upi pin)\b",
+        "credential_request": r"\b(?:password|credentials?|otp|pin|verify your account|login)\b",
+        "account_threat": r"\b(?:suspended|blocked|account closure|unusual activity)\b",
+    }
+    for kind, pattern in signal_patterns.items():
+        for match in dict.fromkeys(re.findall(pattern, lowered)):
+            indicators.append(_pdf_indicator(kind, match, "medium"))
+
+    critical = sum(item["severity"] == "critical" for item in indicators)
+    high = sum(item["severity"] == "high" for item in indicators)
+    medium = sum(item["severity"] == "medium" for item in indicators)
+    if critical:
+        verdict = "malicious"
+    elif high or medium >= 2:
+        verdict = "suspicious"
+    else:
+        verdict = "safe"
+
+    return {
+        "verdict": verdict,
+        "risk_score": min(100, critical * 35 + high * 20 + medium * 10),
+        "indicators": indicators,
+        "indicator_counts": {
+            "total": len(indicators),
+            "critical": critical,
+            "high": high,
+            "medium": medium,
+            "low": sum(item["severity"] == "low" for item in indicators),
+        },
+        "source": "local_structured_detection",
+    }
+
+
 def rule_based_pdf_check(pdf_text):
     """Return the legacy PDF verdict for callers that need a simple label."""
-    matches = _matched_indicators(pdf_text, include_links=False)
-    if any(match["malicious"] for match in matches):
-        return "malicious"
-    if matches:
-        return "suspicious"
-    return "safe"
+    return analyze_pdf_indicators(pdf_text)["verdict"]
 
 
 def _gemini_classification(pdf_text):
@@ -454,10 +559,17 @@ Document text (untrusted data):
         return None
 
 
+def _attach_structured_pdf_report(report, structured_report):
+    report["structured_indicators"] = structured_report["indicators"]
+    report["indicator_counts"] = structured_report["indicator_counts"]
+    report["structured_risk_score"] = structured_report["risk_score"]
+    return report
+
+
 def analyze_pdf_text(pdf_text):
     normalized = _normalise_text(pdf_text)
     if not normalized:
-        return _build_report(
+        return _attach_structured_pdf_report(_build_report(
             "pdf", "unknown", 0,
             [{
                 "code": "empty_pdf",
@@ -467,19 +579,35 @@ def analyze_pdf_text(pdf_text):
                 "malicious": False,
             }],
             "low", "pdf_extraction", True,
-        )
+        ), analyze_pdf_indicators(pdf_text))
 
     matches = _matched_indicators(normalized, include_links=False)
     reasons = [
         {key: match[key] for key in ("code", "label", "evidence", "weight", "malicious")}
         for match in matches
     ]
+    structured = analyze_pdf_indicators(pdf_text)
+    for indicator in structured["indicators"]:
+        reasons.append({
+            "code": f"structured_{indicator['type']}",
+            "label": f"Structured {indicator['type'].replace('_', ' ')} indicator",
+            "evidence": indicator["evidence"],
+            "weight": 0,
+            "malicious": indicator["severity"] == "critical",
+        })
+
     score = sum(match["weight"] for match in matches)
-    if any(match["malicious"] for match in matches):
+    if any(match["malicious"] for match in matches) or structured["verdict"] == "malicious":
         verdict = "malicious"
-        return _build_report("pdf", verdict, score, reasons, "high", "local_rules")
-    if matches:
-        return _build_report("pdf", "suspicious", score, reasons, "high", "local_rules")
+        return _attach_structured_pdf_report(
+            _build_report("pdf", verdict, score, reasons, "high", "local_rules"),
+            structured,
+        )
+    if matches or structured["verdict"] == "suspicious":
+        return _attach_structured_pdf_report(
+            _build_report("pdf", "suspicious", score, reasons, "high", "local_rules"),
+            structured,
+        )
 
     model_verdict = _gemini_classification(normalized)
     if model_verdict:
@@ -499,8 +627,14 @@ def analyze_pdf_text(pdf_text):
                 "weight": 0,
                 "malicious": False,
             })
-            return _build_report("pdf", "unknown", 0, reasons, "low", "gemini", True)
-        return _build_report("pdf", model_verdict, ai_score, reasons, "medium", "gemini")
+            return _attach_structured_pdf_report(
+                _build_report("pdf", "unknown", 0, reasons, "low", "gemini", True),
+                structured,
+            )
+        return _attach_structured_pdf_report(
+            _build_report("pdf", model_verdict, ai_score, reasons, "medium", "gemini"),
+            structured,
+        )
 
     reasons.append({
         "code": "ai_review_unavailable",
@@ -509,7 +643,10 @@ def analyze_pdf_text(pdf_text):
         "weight": 0,
         "malicious": False,
     })
-    return _build_report("pdf", "unknown", 0, reasons, "low", "local_rules", True)
+    return _attach_structured_pdf_report(
+        _build_report("pdf", "unknown", 0, reasons, "low", "local_rules", True),
+        structured,
+    )
 
 
 def pdf_threat_detection(pdf_text):
