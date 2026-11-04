@@ -1,4 +1,6 @@
 from pathlib import Path
+import re
+import unicodedata
 
 from django.conf import settings
 from django.shortcuts import render
@@ -155,81 +157,157 @@ def extract_pdf_text(file_obj):
         return ""
 
 
+def normalize_pdf_text(pdf_text):
+    """Normalize common whitespace, Unicode, and URL obfuscation variants."""
+    text = unicodedata.normalize("NFKC", str(pdf_text))
+    text = text.replace("\u200b", "").replace("\ufeff", "")
+    text = re.sub(r"(?i)\bhxxps?\s*:\s*//", "https://", text)
+    text = re.sub(r"(?i)\bwww\s*\[\s*dot\s*\]\s*", "www.", text)
+    text = re.sub(
+        r"(?i)\[\s*(?:dot|\.)\s*\]|\(\s*dot\s*\)|\s+dot\s+",
+        ".",
+        text,
+    )
+    text = re.sub(r"(?i)\s*\[\s*:\s*\]\s*", ":", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _indicator(kind, value, severity, evidence=None):
+    return {
+        "type": kind,
+        "value": value,
+        "severity": severity,
+        "evidence": evidence or value,
+    }
+
+
+def analyze_pdf_indicators(pdf_text):
+    """Extract structured, explainable threat signals from PDF text."""
+    text = normalize_pdf_text(pdf_text)
+    lowered = text.lower()
+    indicators = []
+
+    url_pattern = r"(?i)\b(?:https?://|www\.)[^\s<>'\"]+"
+    urls = []
+    for match in re.findall(url_pattern, text):
+        url = match.rstrip(".,;:!?)]}")
+        if url not in urls:
+            urls.append(url)
+            indicators.append(_indicator("url", url, "medium"))
+
+    domain_pattern = r"(?i)(?<![@\w])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b"
+    domains = []
+    for domain in re.findall(domain_pattern, text):
+        domain = domain.lower().rstrip(".")
+        if domain not in domains:
+            domains.append(domain)
+            severity = "high" if any(domain in url.lower() for url in urls) else "medium"
+            indicators.append(_indicator("domain", domain, severity))
+
+    email_pattern = r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,63}\b"
+    for address in dict.fromkeys(re.findall(email_pattern, lowered)):
+        indicators.append(_indicator("email_address", address, "low"))
+
+    attachment_pattern = (
+        r"(?i)\b[\w .-]+\.(?:exe|scr|js|vbs|ps1|bat|cmd|msi|dll|iso|img|"
+        r"docm|xlsm|pptm|zip|rar|7z)\b"
+    )
+    for attachment in dict.fromkeys(match.strip() for match in re.findall(attachment_pattern, text)):
+        indicators.append(_indicator("attachment", attachment, "high"))
+
+    attachment_terms = (
+        r"\b(?:open|enable macros?|run|execute|download)\b.{0,60}"
+        r"\b(?:attachment|attached file|document)\b"
+    )
+    for match in dict.fromkeys(re.findall(attachment_terms, lowered)):
+        indicators.append(_indicator("attachment_instruction", match, "high"))
+
+    deobfuscated = re.sub(r"[\s._-]+", "", lowered)
+    command_patterns = {
+        "powershell": r"(?:powershell|p0wershell)",
+        "command_execution": r"(?:cmd(?:/c|\.exe/c)|commandprompt|shellcode)",
+        "encoded_command": r"(?:-enc(?:odedcommand)?|frombase64string|base64)",
+        "payload_execution": r"(?:execute|run|download)(?:the)?payload",
+        "security_bypass": r"(?:disable|bypass)(?:your)?(?:antivirus|security|defender)",
+        "malware": r"(?:malware|ransomware|trojan|exploit)",
+    }
+    for kind, pattern in command_patterns.items():
+        for match in dict.fromkeys(re.findall(pattern, deobfuscated)):
+            indicators.append(_indicator("obfuscated_command" if kind == "powershell" else kind, match, "critical"))
+
+    signal_patterns = {
+        "urgency": r"\b(?:urgent|immediately|final warning|act now|expires today|within \d+ hours?)\b",
+        "payment_request": r"\b(?:payment|pay now|invoice|refund|customs charge|bank details|upi pin)\b",
+        "credential_request": r"\b(?:password|credentials?|otp|pin|verify your account|login)\b",
+        "account_threat": r"\b(?:suspended|blocked|account closure|service suspension|unusual activity)\b",
+    }
+    for kind, pattern in signal_patterns.items():
+        for match in dict.fromkeys(re.findall(pattern, lowered)):
+            indicators.append(_indicator(kind, match, "medium"))
+
+    malicious_count = sum(
+        indicator["severity"] == "critical" for indicator in indicators
+    )
+    high_count = sum(indicator["severity"] == "high" for indicator in indicators)
+    medium_count = sum(indicator["severity"] == "medium" for indicator in indicators)
+    score = min(100, malicious_count * 35 + high_count * 20 + medium_count * 10)
+    if malicious_count:
+        verdict = "malicious"
+    elif high_count or medium_count >= 2:
+        verdict = "suspicious"
+    else:
+        verdict = "safe"
+
+    return {
+        "verdict": verdict,
+        "risk_score": score,
+        "indicators": indicators,
+        "indicator_counts": {
+            "total": len(indicators),
+            "critical": malicious_count,
+            "high": high_count,
+            "medium": medium_count,
+            "low": sum(i["severity"] == "low" for i in indicators),
+        },
+        "source": "local_structured_detection",
+    }
+
+
 def rule_based_pdf_check(pdf_text):
-    text = str(pdf_text).lower()
-
-    # STRONG malicious indicators
-    malicious_keywords = [
-        "payload.exe",
-        "cmd /c",
-        "powershell",
-        "disable antivirus",
-        "bypass security",
-        "exploit",
-        "malware",
-        "ransomware",
-        "trojan",
-        "shellcode",
-        "execute payload",
-        "download payload",
-        "run script",
-        "execute script"
-    ]
-
-    # medium suspicious indicators
-    suspicious_keywords = [
-        "verify your account",
-        "click here",
-        "urgent",
-        "bank account",
-        "login immediately",
-        "password",
-        "otp",
-        "suspended",
-        "payment",
-        "account closure",
-        "credentials",
-        "bank details"
-    ]
-
-    # 🔴 PRIORITY: malicious first
-    for word in malicious_keywords:
-        if word in text:
-            print("MALICIOUS KEYWORD MATCH:", word, flush=True)
-            return "malicious"
-
-    # 🟡 then suspicious
-    for word in suspicious_keywords:
-        if word in text:
-            print("SUSPICIOUS KEYWORD MATCH:", word, flush=True)
-            return "suspicious"
-
-    return "safe"
+    """Return the legacy label while structured detection remains available."""
+    return analyze_pdf_indicators(pdf_text)["verdict"]
 
 
 def pdf_threat_detection(pdf_text):
     if not pdf_text or not str(pdf_text).strip():
         print("EMPTY PDF TEXT", flush=True)
-        return "suspicious"
+        return {
+            "verdict": "suspicious",
+            "risk_score": 50,
+            "indicators": [],
+            "indicator_counts": {"total": 0, "critical": 0, "high": 0, "medium": 0, "low": 0},
+            "source": "empty_document",
+        }
 
-    rule_result = rule_based_pdf_check(pdf_text)
+    report = analyze_pdf_indicators(pdf_text)
+    rule_result = report["verdict"]
     print("RULE-BASED PDF RESULT:", rule_result, flush=True)
 
     # For project reliability, immediately trust clear rule hits
     if rule_result in ["malicious", "suspicious"]:
-        return rule_result
+        return report
 
     api_key = getattr(settings, "GEMINI_API_KEY", None)
 
     if api_key is None:
         print("GEMINI API KEY NOT SET", flush=True)
-        return rule_result
+        return report
 
     api_key = str(api_key).strip()
 
     if not api_key or api_key == "PASTE_YOUR_GEMINI_API_KEY_HERE":
         print("INVALID GEMINI API KEY", flush=True)
-        return rule_result
+        return report
 
     try:
         client = genai.Client(api_key=api_key)
@@ -268,25 +346,27 @@ malicious
         print("PDF MODEL RAW OUTPUT:", output, flush=True)
 
         if output == "malicious":
-            return "malicious"
+            report["verdict"] = "malicious"
         elif output == "suspicious":
-            return "suspicious"
+            report["verdict"] = "suspicious"
         elif output == "safe":
-            return "safe"
+            report["verdict"] = "safe"
 
-        if "malicious" in output:
-            return "malicious"
+        elif "malicious" in output:
+            report["verdict"] = "malicious"
         elif "suspicious" in output:
-            return "suspicious"
+            report["verdict"] = "suspicious"
         elif "safe" in output:
-            return "safe"
+            report["verdict"] = "safe"
 
-        print("UNEXPECTED OUTPUT, USING RULE RESULT", flush=True)
-        return rule_result
+        else:
+            print("UNEXPECTED OUTPUT, USING RULE RESULT", flush=True)
+        report["source"] = "gemini"
+        return report
 
     except Exception as e:
         print("PDF DETECTION ERROR:", e, flush=True)
-        return rule_result
+        return report
 
 
 
@@ -294,6 +374,7 @@ def Home(request):
     result = None
     pdf_result = None
     pdf_message = None
+    pdf_report = None
     form = MessageForm()
 
     print("REQUEST METHOD:", request.method, flush=True)
@@ -327,12 +408,18 @@ def Home(request):
                         pdf_result = "suspicious"
                         pdf_message = "Could not extract text from this PDF."
                     else:
-                        pdf_result = pdf_threat_detection(pdf_text)
-                        pdf_message = f"PDF Threat Result: {pdf_result.upper()}"
+                        pdf_report = pdf_threat_detection(pdf_text)
+                        pdf_result = pdf_report["verdict"]
+                        indicator_total = pdf_report["indicator_counts"]["total"]
+                        pdf_message = (
+                            f"PDF Threat Result: {pdf_result.upper()} "
+                            f"({indicator_total} indicators matched)"
+                        )
 
     return render(request, "home.html", {
         "form": form,
         "result": result,
         "pdf_result": pdf_result,
         "pdf_message": pdf_message,
+        "pdf_report": pdf_report,
     })
