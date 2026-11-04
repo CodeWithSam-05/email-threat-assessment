@@ -7,6 +7,7 @@ class ScanRecord(models.Model):
         PDF = "pdf", "PDF"
 
     class Verdict(models.TextChoices):
+        UNKNOWN = "unknown", "Unknown"
         HAM = "ham", "Ham"
         SPAM = "spam", "Spam"
         SAFE = "safe", "Safe"
